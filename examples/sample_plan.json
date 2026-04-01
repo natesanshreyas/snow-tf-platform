@@ -1,0 +1,49 @@
+{
+  "_comment": "Example Plan output from Planner Agent for the sample SNOW ticket above.",
+  "units": [
+    {
+      "id": "rg",
+      "type": "resource_group",
+      "depends_on": [],
+      "constraints": {
+        "required_rg": null,
+        "forbidden_rg": null,
+        "location": "eastus2"
+      }
+    },
+    {
+      "id": "rg_postgres",
+      "type": "resource_group",
+      "depends_on": [],
+      "constraints": {
+        "required_rg": "rg-postgres-dev",
+        "forbidden_rg": null,
+        "location": "eastus2"
+      }
+    },
+    {
+      "id": "storage",
+      "type": "storage_account",
+      "depends_on": ["rg"],
+      "constraints": {
+        "required_rg": null,
+        "forbidden_rg": null,
+        "location": "eastus2"
+      }
+    },
+    {
+      "id": "postgres",
+      "type": "postgres_flex",
+      "depends_on": ["rg_postgres"],
+      "constraints": {
+        "required_rg": "rg-postgres-dev",
+        "forbidden_rg": "rg-cortex-dev",
+        "location": "eastus2"
+      }
+    }
+  ],
+  "questions": [
+    "Should we reuse existing rg-cortex-dev or create a new one?"
+  ],
+  "finalized": false
+}

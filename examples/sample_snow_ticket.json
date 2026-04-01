@@ -1,0 +1,11 @@
+{
+  "number": "RITM0001234",
+  "short_description": "Provision Azure postgres + storage for cortex-dev",
+  "description": "We need a new postgres flexible server and storage account for the cortex application in the dev environment.\n\nCost center: CC-4421\n\nRequirements:\n- Postgres Flexible Server, Standard_D2s_v3, eastus2\n- Storage account for blobs, LRS, eastus2\n- Must use existing rg-cortex-dev if it exists\n- Postgres must NOT go in the app resource group",
+  "approval": "approved",
+  "requested_by": {
+    "value": "alice.smith@contoso.com",
+    "display_value": "Alice Smith"
+  },
+  "cloud_provider": "azure"
+}

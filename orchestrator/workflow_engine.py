@@ -244,6 +244,32 @@ class WorkflowEngine:
 
         return run
 
+    async def resume_cost_approval(self, run_id: str, approved: bool) -> WorkflowRun:
+        """Resume a workflow paused at HITL 2 (cost + quota gate)."""
+        run = load_run(run_id)
+        if not run:
+            raise ValueError(f"Unknown run_id: {run_id}")
+
+        if run.status != WorkflowStatus.WAITING_FOR_COST_APPROVAL:
+            raise ValueError(f"run={run_id} is not at cost approval step (status={run.status})")
+
+        run.cost_approved = approved
+        run.transition(WorkflowStatus.EXECUTING)
+        store_run(run)
+
+        logger.info("Cost approval for run=%s: %s", run_id, "APPROVED" if approved else "REJECTED")
+
+        workflow_fn = self._workflows.get(run.request_type)
+        try:
+            await workflow_fn(run.request, run)
+        except Exception as exc:
+            logger.exception("run=%s cost-approval resume failed: %s", run_id, exc)
+            run.error = str(exc)
+            run.transition(WorkflowStatus.FAILED)
+            store_run(run)
+
+        return run
+
     async def resume(self, run_id: str, human_answers: Dict[str, str]) -> WorkflowRun:
         """Resume a paused workflow after human answers arrive from ServiceNow.
 

@@ -1,23 +1,29 @@
 """
-planner_agent.py — Agent 1: Planner Agent (Microsoft Agent Framework)
+planner_agent.py — Agent 1: Planner Agent (Azure Agent Framework SDK)
 
-THIS FILE USES MICROSOFT AGENT FRAMEWORK (agent-framework RC5).
-It is the ONLY place in the Azure workflow that calls an LLM for planning.
+Uses the Azure Agent Framework SDK (agent-framework RC5) for orchestration.
 
 Responsibilities:
-- Interpret the ServiceNow request in natural language
-- Identify infra units to be created (resource_group, postgres_flex, storage, etc.)
-- Apply invariant constraints (e.g. "postgres never goes in app_rg")
-- Identify unresolved questions that require human input
-- Optionally re-plan after environment scan results are injected
+- Interpret the ServiceNow request and decompose it into infra units
+- Identify dependency order (resource group must precede child resources)
+- Apply invariant constraints (e.g. postgres never in app_rg)
+- Raise a HITL question for each ambiguous resource group decision
+- Re-plan after human answers are injected via UserProxyAgent
 
-Output contract: Plan object (defined in orchestrator/models.py)
+HITL paths
+----------
+Initial run (no human_answers):
+    Uses SingleAgentRuntime — planner returns a Plan that may contain
+    questions.  If questions are present, workflow.py pauses the run and
+    writes them to the ServiceNow ticket.
+
+Resume run (human_answers populated):
+    Uses RoundRobinGroupChat[planner, human_proxy] so the agent framework
+    sees a proper human turn.  UserProxyAgent replays stored answers;
+    planner finalises the plan with no remaining questions.
+
+Output contract: Plan (orchestrator/models.py)
 The agent NEVER generates Terraform — that is Agent 3's job.
-
-NOTE: Microsoft Agent Framework is currently RC5 (pre-GA as of March 2026).
-The import paths and API below reflect the RC5 package structure.
-Exact method signatures may shift before GA — check the migration guide:
-https://learn.microsoft.com/en-us/agent-framework/migration-guide/
 """
 
 from __future__ import annotations
@@ -25,16 +31,18 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
-# Microsoft Agent Framework imports
-# RC5 package: pip install agent-framework --pre
+# Azure Agent Framework SDK imports (agent-framework RC5)
 # ---------------------------------------------------------------------------
-from agent_framework import SingleAgentRuntime                          # type: ignore[import]
-from agent_framework.agents import AssistantAgent                       # type: ignore[import]
-from agent_framework.messages import TextMessage                        # type: ignore[import]
-from agent_framework.models import AzureOpenAIChatCompletionClient      # type: ignore[import]
+from agent_framework import SingleAgentRuntime                           # type: ignore[import]
+from agent_framework.agents import AssistantAgent, UserProxyAgent        # type: ignore[import]
+from agent_framework.messages import TextMessage                         # type: ignore[import]
+from agent_framework.models import AzureOpenAIChatCompletionClient       # type: ignore[import]
+from agent_framework.conditions import MaxMessageTermination             # type: ignore[import]
+from agent_framework import RoundRobinGroupChat                          # type: ignore[import]
 
 from orchestrator.models import Plan, PlanUnit, SnowRequest, UnitConstraints
 
@@ -46,19 +54,22 @@ logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """\
 You are an Azure infrastructure planner. Given a ServiceNow provisioning request,
-you decompose it into discrete infrastructure units and identify any constraints or
-unresolved questions.
+decompose it into discrete infrastructure units with dependency ordering, then
+identify constraints and unresolved questions.
 
-Rules:
+=== RULES ===
+
 1. Output ONLY a JSON object matching the Plan schema — no prose, no Terraform.
-2. Each unit must have: id (snake_case), type, depends_on (list of ids), constraints (object).
-3. Postgres units must NEVER be placed in an app resource group (forbidden_rg: app_rg).
-4. If you are uncertain about any parameter, add it to the `questions` list.
-5. Resource groups must always be listed before resources that depend on them.
-6. If environment scan results are provided, use them to avoid creating resources
-   that already exist — instead note them as references.
+2. Every unit must have: id (snake_case), type, depends_on (list of ids), constraints.
+3. Resource groups MUST appear before any resource that depends on them.
+4. Postgres units must NEVER be placed in an app resource group (forbidden_rg: "app_rg").
+5. If environment scan shows a resource group already exists, raise a HITL question:
+     "Resource group '{name}' already exists. Use existing (A) or create new (B)?"
+6. Add to `questions` any parameter that is ambiguous or requires human confirmation.
+7. If human answers are provided, incorporate them and output a finalized plan with
+   an empty `questions` list. Append "PLAN_FINALIZED" on the last line.
 
-Output schema:
+=== OUTPUT SCHEMA ===
 {
   "units": [
     {
@@ -77,20 +88,15 @@ Output schema:
 """
 
 # ---------------------------------------------------------------------------
-# Model client factory
+# Model client
 # ---------------------------------------------------------------------------
 
 
 def _make_model_client() -> AzureOpenAIChatCompletionClient:
-    """Build the Azure OpenAI client for the planner agent.
-
-    TODO: Replace env var reads with Key Vault / managed identity for production.
-    """
     return AzureOpenAIChatCompletionClient(
         azure_deployment=os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"],
         azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-        api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21"),
-        # TODO: Switch to DefaultAzureCredential for production
+        api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2025-04-01-preview"),
         api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
     )
 
@@ -101,22 +107,18 @@ def _make_model_client() -> AzureOpenAIChatCompletionClient:
 
 
 def _parse_plan(raw: str) -> Plan:
-    """Parse the agent's JSON output into a typed Plan object.
-
-    Raises ValueError if the output does not match the expected schema.
-    """
+    """Parse agent JSON output into a typed Plan. Strips PLAN_FINALIZED marker."""
+    raw = raw.replace("PLAN_FINALIZED", "").strip()
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        # Try to extract JSON from prose if the model wrapped it
-        import re
+    except json.JSONDecodeError:
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if match:
             data = json.loads(match.group(0))
         else:
-            raise ValueError(f"Planner returned non-JSON output: {raw[:300]}") from exc
+            raise ValueError(f"Planner returned non-JSON: {raw[:300]}")
 
-    units = []
+    units: List[PlanUnit] = []
     for u in data.get("units", []):
         c = u.get("constraints", {})
         units.append(PlanUnit(
@@ -127,14 +129,152 @@ def _parse_plan(raw: str) -> Plan:
                 required_rg=c.get("required_rg"),
                 forbidden_rg=c.get("forbidden_rg"),
                 location=c.get("location"),
-                extra={k: v for k, v in c.items() if k not in ("required_rg", "forbidden_rg", "location")},
+                extra={k: v for k, v in c.items()
+                       if k not in ("required_rg", "forbidden_rg", "location")},
             ),
         ))
 
-    return Plan(
-        units=units,
-        questions=data.get("questions", []),
+    return Plan(units=units, questions=data.get("questions", []))
+
+
+# ---------------------------------------------------------------------------
+# User message builder
+# ---------------------------------------------------------------------------
+
+
+def _build_user_message(
+    request: SnowRequest,
+    scan_results: Optional[Dict[str, Any]],
+    human_answers: Optional[Dict[str, str]],
+) -> str:
+    parts = [
+        f"ServiceNow Ticket: {request.ticket_id}",
+        f"Application: {request.application or '(not specified)'}",
+        f"Environment: {request.environment}",
+        f"Requested by: {request.requested_by}",
+        f"Short description: {request.short_description}",
+        f"Description:\n{request.description}",
+    ]
+
+    if scan_results:
+        parts.append(
+            "\n--- Environment Scan Results ---\n"
+            + json.dumps(scan_results, indent=2)
+        )
+
+    if human_answers:
+        parts.append(
+            "\n--- Human Answers (incorporate these and finalize the plan) ---\n"
+            + "\n".join(f"Q: {q}\nA: {a}" for q, a in human_answers.items())
+            + "\n\nOutput the finalized plan with an empty questions list, "
+              "then append PLAN_FINALIZED on a new line."
+        )
+
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Single-turn planning (initial run — no human answers)
+# ---------------------------------------------------------------------------
+
+
+async def _run_planner_single_turn(
+    model_client: AzureOpenAIChatCompletionClient,
+    request: SnowRequest,
+    scan_results: Optional[Dict[str, Any]],
+) -> Plan:
+    """Run one planning turn. Returns a Plan that may contain questions."""
+    agent = AssistantAgent(
+        name="azure_planner",
+        system_message=_SYSTEM_PROMPT,
+        model_client=model_client,
     )
+
+    user_content = _build_user_message(request, scan_results, None)
+
+    runtime = SingleAgentRuntime()
+    runtime.register_agent(agent)
+    await runtime.start()
+
+    response = await runtime.send_message(
+        TextMessage(content=user_content, source="orchestrator"),
+        recipient="azure_planner",
+    )
+    await runtime.stop()
+
+    raw = response.content if hasattr(response, "content") else str(response)
+    logger.info("Planner (initial) output (first 300 chars): %s", raw[:300])
+    return _parse_plan(raw)
+
+
+# ---------------------------------------------------------------------------
+# HITL resume path — uses UserProxyAgent + RoundRobinGroupChat
+# ---------------------------------------------------------------------------
+
+
+async def _run_planner_with_hitl(
+    model_client: AzureOpenAIChatCompletionClient,
+    request: SnowRequest,
+    scan_results: Optional[Dict[str, Any]],
+    human_answers: Dict[str, str],
+) -> Plan:
+    """Resume planning with stored human answers via UserProxyAgent.
+
+    The agent framework runtime sees a proper human turn (UserProxyAgent)
+    rather than answers injected into the system prompt.  This keeps the
+    conversation history semantically correct.
+
+    Flow:
+      1. Planner receives full context (ticket + scan + Q&A) — outputs plan with questions
+      2. UserProxyAgent returns stored answers (one answer per exchange)
+      3. Planner finalises plan (empty questions) and appends PLAN_FINALIZED
+      4. MaxMessageTermination(6) stops the chat
+    """
+    answers_iter = iter(human_answers.values())
+
+    async def _stored_input_fn(prompt: str) -> str:  # type: ignore[override]
+        """Return the next pre-stored human answer, or signal completion."""
+        try:
+            answer = next(answers_iter)
+            logger.info("UserProxyAgent returning stored answer for prompt: %s…", prompt[:80])
+            return answer
+        except StopIteration:
+            return "PLAN_FINALIZED"
+
+    planner = AssistantAgent(
+        name="azure_planner",
+        system_message=_SYSTEM_PROMPT,
+        model_client=model_client,
+    )
+    human_proxy = UserProxyAgent(
+        name="human_approver",
+        input_func=_stored_input_fn,
+    )
+
+    termination = MaxMessageTermination(max_messages=6)
+    team = RoundRobinGroupChat(
+        participants=[planner, human_proxy],
+        termination_condition=termination,
+    )
+
+    user_content = _build_user_message(request, scan_results, human_answers)
+    result = await team.run(task=user_content)
+
+    # Extract the last message from the planner agent
+    planner_messages = [
+        m for m in result.messages
+        if getattr(m, "source", None) == "azure_planner"
+    ]
+
+    if not planner_messages:
+        raise ValueError("Planner produced no messages in HITL group chat")
+
+    raw = planner_messages[-1].content if hasattr(planner_messages[-1], "content") else str(planner_messages[-1])
+    logger.info("Planner (HITL) final output (first 300 chars): %s", raw[:300])
+
+    plan = _parse_plan(raw)
+    plan.finalized = True
+    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -149,77 +289,24 @@ async def run_planner_agent(
 ) -> Plan:
     """Run the Planner Agent and return a Plan.
 
-    This is an MAF-orchestrated agent call. The runtime manages the message
-    loop; we send one user message and expect one structured JSON response.
-
     Args:
         request:       The approved ServiceNow request.
-        scan_results:  Optional environment scan output (Agent 2). If provided,
-                       injected as context so the planner can avoid duplicates.
-        human_answers: Optional answers to previously raised questions.
-                       Injected so the planner can finalize an incomplete plan.
+        scan_results:  Environment scan output (what already exists in Azure).
+                       Injected so the planner raises HITL questions for
+                       existing resource groups.
+        human_answers: Stored answers from the ServiceNow work note.
+                       When present, uses UserProxyAgent (HITL resume path).
 
     Returns:
-        Plan with units and any remaining questions.
+        Plan with units, dependency order, and any unresolved questions.
     """
     model_client = _make_model_client()
 
-    # MAF: create an assistant agent with a system prompt and no tools.
-    # The planner reasons entirely from context — it calls no external APIs.
-    agent = AssistantAgent(
-        name="azure_planner",
-        system_message=_SYSTEM_PROMPT,
-        model_client=model_client,
-    )
-
-    # Build the user message — assemble all context into a single prompt
-    user_content = _build_user_message(request, scan_results, human_answers)
-
-    # MAF: SingleAgentRuntime runs the agent for one request/response cycle
-    runtime = SingleAgentRuntime()
-    runtime.register_agent(agent)
-    await runtime.start()
-
-    response = await runtime.send_message(
-        TextMessage(content=user_content, source="orchestrator"),
-        recipient="azure_planner",
-    )
-    await runtime.stop()
-
-    raw_output = response.content if hasattr(response, "content") else str(response)
-    logger.info("Planner agent raw output (first 300 chars): %s", raw_output[:300])
-
-    plan = _parse_plan(raw_output)
-    logger.info(
-        "Plan: %d units, %d questions",
-        len(plan.units), len(plan.questions),
-    )
-    return plan
-
-
-def _build_user_message(
-    request: SnowRequest,
-    scan_results: Optional[Dict[str, Any]],
-    human_answers: Optional[Dict[str, str]],
-) -> str:
-    """Assemble the full context message for the planner agent."""
-    parts = [
-        f"ServiceNow Ticket: {request.ticket_id}",
-        f"Requested by: {request.requested_by}",
-        f"Short description: {request.short_description}",
-        f"Description:\n{request.description}",
-    ]
-
-    if scan_results:
-        parts.append(
-            "\n--- Environment Scan Results ---\n"
-            + json.dumps(scan_results, indent=2)
-        )
-
     if human_answers:
-        parts.append(
-            "\n--- Human Answers to Previous Questions ---\n"
-            + "\n".join(f"Q: {q}\nA: {a}" for q, a in human_answers.items())
+        logger.info(
+            "run_planner_agent: HITL resume path (%d answers)", len(human_answers)
         )
+        return await _run_planner_with_hitl(model_client, request, scan_results, human_answers)
 
-    return "\n\n".join(parts)
+    logger.info("run_planner_agent: initial single-turn path")
+    return await _run_planner_single_turn(model_client, request, scan_results)

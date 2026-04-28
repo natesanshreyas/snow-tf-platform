@@ -2,9 +2,10 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 
-# Microsoft Agent Framework (pre-GA — RC5 as of March 2026)
-# https://github.com/microsoft/agent-framework
-agent-framework --pre
+# Microsoft AutoGen 0.4 (agent framework)
+autogen-agentchat>=0.7.5
+autogen-ext[openai]>=0.7.5
+autogen-core>=0.7.5
 
 # Azure identity (for managed identity / service principal auth)
 azure-identity>=1.19.0

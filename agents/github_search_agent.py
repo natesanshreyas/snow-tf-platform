@@ -22,12 +22,10 @@ import json
 import logging
 import os
 import re
-from typing import Dict, List
+from typing import Dict, List, Optional
 
-from agent_framework import SingleAgentRuntime                           # type: ignore[import]
-from agent_framework.agents import AssistantAgent                        # type: ignore[import]
-from agent_framework.messages import TextMessage                         # type: ignore[import]
-from agent_framework.models import AzureOpenAIChatCompletionClient       # type: ignore[import]
+from autogen_agentchat.agents import AssistantAgent
+from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
 
 from mcp.github import search_module_repos
 
@@ -143,17 +141,8 @@ async def run_github_search_agent(
         model_client=model_client,
     )
 
-    runtime = SingleAgentRuntime()
-    runtime.register_agent(agent)
-    await runtime.start()
-
-    response = await runtime.send_message(
-        TextMessage(content=user_content, source="orchestrator"),
-        recipient="github_search_agent",
-    )
-    await runtime.stop()
-
-    raw = response.content if hasattr(response, "content") else str(response)
+    result = await agent.run(task=user_content)
+    raw = result.messages[-1].content
     logger.info("GH Search Agent output: %s", raw[:300])
 
     llm_mapping = _parse_mapping(raw)

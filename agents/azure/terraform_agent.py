@@ -24,10 +24,8 @@ import re
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
-from agent_framework import SingleAgentRuntime                           # type: ignore[import]
-from agent_framework.agents import AssistantAgent                        # type: ignore[import]
-from agent_framework.messages import TextMessage                         # type: ignore[import]
-from agent_framework.models import AzureOpenAIChatCompletionClient       # type: ignore[import]
+from autogen_agentchat.agents import AssistantAgent
+from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
 
 from mcp.github import get_latest_module_version, read_module_readme
 from orchestrator.models import EvaluatorResult, PlanUnit, WorkflowRun
@@ -267,17 +265,8 @@ async def run_terraform_agent(
             feedback=feedback,
         )
 
-        runtime = SingleAgentRuntime()
-        runtime.register_agent(agent)
-        await runtime.start()
-
-        response = await runtime.send_message(
-            TextMessage(content=user_message, source="orchestrator"),
-            recipient="azure_tf_generator",
-        )
-        await runtime.stop()
-
-        raw = response.content if hasattr(response, "content") else str(response)
+        result = await agent.run(task=user_message)
+        raw = result.messages[-1].content
         main_tf, variables_tf = _parse_terraform_output(raw)
 
         # Run all evaluators (plain function calls — not MAF agents)

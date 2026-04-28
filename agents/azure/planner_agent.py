@@ -37,12 +37,10 @@ from typing import Any, Dict, List, Optional
 # ---------------------------------------------------------------------------
 # Azure Agent Framework SDK imports (agent-framework RC5)
 # ---------------------------------------------------------------------------
-from agent_framework import SingleAgentRuntime                           # type: ignore[import]
-from agent_framework.agents import AssistantAgent, UserProxyAgent        # type: ignore[import]
-from agent_framework.messages import TextMessage                         # type: ignore[import]
-from agent_framework.models import AzureOpenAIChatCompletionClient       # type: ignore[import]
-from agent_framework.conditions import MaxMessageTermination             # type: ignore[import]
-from agent_framework import RoundRobinGroupChat                          # type: ignore[import]
+from autogen_agentchat.agents import AssistantAgent, UserProxyAgent
+from autogen_agentchat.teams import RoundRobinGroupChat
+from autogen_agentchat.conditions import MaxMessageTermination
+from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
 
 from orchestrator.models import Plan, PlanUnit, SnowRequest, UnitConstraints
 
@@ -191,18 +189,9 @@ async def _run_planner_single_turn(
     )
 
     user_content = _build_user_message(request, scan_results, None)
+    result = await agent.run(task=user_content)
 
-    runtime = SingleAgentRuntime()
-    runtime.register_agent(agent)
-    await runtime.start()
-
-    response = await runtime.send_message(
-        TextMessage(content=user_content, source="orchestrator"),
-        recipient="azure_planner",
-    )
-    await runtime.stop()
-
-    raw = response.content if hasattr(response, "content") else str(response)
+    raw = result.messages[-1].content
     logger.info("Planner (initial) output (first 300 chars): %s", raw[:300])
     return _parse_plan(raw)
 
@@ -251,16 +240,14 @@ async def _run_planner_with_hitl(
         input_func=_stored_input_fn,
     )
 
-    termination = MaxMessageTermination(max_messages=6)
     team = RoundRobinGroupChat(
         participants=[planner, human_proxy],
-        termination_condition=termination,
+        termination_condition=MaxMessageTermination(max_messages=6),
     )
 
     user_content = _build_user_message(request, scan_results, human_answers)
     result = await team.run(task=user_content)
 
-    # Extract the last message from the planner agent
     planner_messages = [
         m for m in result.messages
         if getattr(m, "source", None) == "azure_planner"
@@ -269,7 +256,7 @@ async def _run_planner_with_hitl(
     if not planner_messages:
         raise ValueError("Planner produced no messages in HITL group chat")
 
-    raw = planner_messages[-1].content if hasattr(planner_messages[-1], "content") else str(planner_messages[-1])
+    raw = planner_messages[-1].content
     logger.info("Planner (HITL) final output (first 300 chars): %s", raw[:300])
 
     plan = _parse_plan(raw)

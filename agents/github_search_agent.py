@@ -27,6 +27,8 @@ from typing import Dict, List, Optional
 from autogen_agentchat.agents import AssistantAgent
 from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
 
+from agents.mock_client import get_model_client
+
 from mcp.github import search_module_repos
 
 logger = logging.getLogger(__name__)
@@ -55,17 +57,8 @@ Output ONLY a JSON object — no prose, no markdown:
 """
 
 
-def _make_model_client() -> Optional[AzureOpenAIChatCompletionClient]:
-    endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
-    deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME", "")
-    if not (endpoint and deployment):
-        return None
-    return AzureOpenAIChatCompletionClient(
-        azure_deployment=deployment,
-        azure_endpoint=endpoint,
-        api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2025-04-01-preview"),
-        api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
-    )
+def _make_model_client():
+    return get_model_client()
 
 
 def _parse_mapping(raw: str) -> Dict[str, str]:
@@ -121,13 +114,6 @@ async def run_github_search_agent(
 
     # Build prompt for the LLM to resolve ambiguous cases
     model_client = _make_model_client()
-    if model_client is None:
-        # No LLM available — pick the first candidate for each ambiguous type
-        logger.warning("GH Search Agent: LLM not configured, using first candidate for ambiguous types")
-        for t, repos in ambiguous.items():
-            mapping[t] = repos[0]
-        return mapping
-
     search_summary = json.dumps(search_results, indent=2)
     user_content = (
         f"GitHub org: {org}\n\n"

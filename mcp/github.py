@@ -326,3 +326,21 @@ async def create_pull_request(
     pr_url: str = resp.json()["html_url"]
     logger.info("Created PR for %s: %s", ticket_id, pr_url)
     return pr_url
+
+
+# ---------------------------------------------------------------------------
+# Demo mode — replace all public functions with fast stubs when DEMO_MODE=true.
+# Set os.environ["DEMO_MODE"] = "true" before importing this module.
+# Agents that do `from mcp.github import X` will receive the mock version
+# because this block runs at import time and overwrites the module-level names.
+# ---------------------------------------------------------------------------
+if os.environ.get("DEMO_MODE", "false").lower() == "true":
+    from mcp.mock_mcp import (  # noqa: F811  (intentional override)
+        search_module_repos,
+        read_module_readme,
+        get_latest_module_version,
+        create_ticket_branch,
+        push_unit_terraform,
+        create_pull_request,
+    )
+    logger.info("mcp.github: DEMO_MODE active — using mock implementations")

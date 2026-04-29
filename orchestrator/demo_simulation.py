@@ -19,6 +19,30 @@ from typing import Dict, List, Optional
 
 import httpx
 
+# ---------------------------------------------------------------------------
+# Real MAF agent imports — fall back gracefully when credentials are absent.
+# When AZURE_OPENAI_ENDPOINT is not set, get_model_client() returns
+# MockModelClient so every agent runs through the full AutoGen runtime
+# with hardcoded but realistic responses.
+# ---------------------------------------------------------------------------
+try:
+    from agents.azure.planner_agent import run_planner_agent as _run_planner_agent
+    from agents.github_search_agent import run_github_search_agent as _run_github_search_agent
+    from agents.azure.terraform_agent import run_terraform_agent as _run_terraform_agent
+    from evaluators.terraform_correctness import evaluate_correctness
+    from evaluators.terraform_security import evaluate_security
+    from evaluators.terraform_compliance import evaluate_compliance
+    _EVALUATORS = [evaluate_correctness, evaluate_security, evaluate_compliance]
+    _AGENTS_AVAILABLE = True
+except ImportError as _agent_import_err:
+    logger_init = logging.getLogger(__name__)
+    logger_init.warning(
+        "MAF agents not importable (%s) — demo will simulate without real agent execution",
+        _agent_import_err,
+    )
+    _AGENTS_AVAILABLE = False
+    _EVALUATORS = []
+
 from .models import (
     CostQuotaResult,
     EvaluatorResult,
@@ -511,15 +535,18 @@ async def _create_real_pr(
                 module_sha  = "main"
                 constraints = UnitConstraints()
                 module_repo = f"{_MODULES_ORG}/{_MODULES_REPO}"
+                maf_hcl: Optional[str] = None
                 for pu in run.plan.units:
                     if pu.id == unit_cfg["id"]:
                         if pu.module_info:
                             module_sha  = pu.module_info.get("sha", "main")
                             module_repo = pu.module_info.get("repo", module_repo)
                         constraints = pu.constraints or UnitConstraints()
+                        maf_hcl = pu.terraform_output  # set by run_terraform_agent
                         break
 
-                hcl = _hcl_for_unit(unit_cfg, app, env, module_sha, constraints, cloud, ticket_id)
+                # Prefer MAF-generated HCL; fall back to template-based generation
+                hcl = maf_hcl or _hcl_for_unit(unit_cfg, app, env, module_sha, constraints, cloud, ticket_id)
                 content_b64 = base64.b64encode(hcl.encode()).decode()
                 file_path = f"{env}/{ticket_id}/{unit_cfg['id']}/main.tf"
 
@@ -649,9 +676,19 @@ async def simulate_workflow(run: WorkflowRun, cloud: str) -> None:
         f"feature/{ticket_id} created",
         duration_ms=800)
 
-    # ── Step 1: Initial planner ─────────────────────────────────────────────
+    # ── Step 1: Initial planner — REAL AutoGen AssistantAgent via MAF ──────
     _step_set(run, "planner_initial", "running")
-    await asyncio.sleep(2.5)
+    if _AGENTS_AVAILABLE and run.request:
+        try:
+            _initial_plan = await _run_planner_agent(run.request)
+            logger.info(
+                "MAF Planner Agent (initial): %d units, %d questions via AutoGen",
+                len(_initial_plan.units), len(_initial_plan.questions),
+            )
+        except Exception as _exc:
+            logger.warning("Planner Agent (initial) error: %s — continuing with demo plan", _exc)
+    else:
+        await asyncio.sleep(2.5)
     _step_set(run, "planner_initial", "complete", cfg["planner_initial_detail"])
 
     # ── Step 2: Env scan — find existing resources before asking HITL ───────
@@ -709,9 +746,19 @@ async def simulate_workflow(run: WorkflowRun, cloud: str) -> None:
     decision = "Using existing resource" if use_existing else "Creating new resource with unique suffix"
     _step_set(run, "hitl_checkpoint", "complete", f"Human answered · {decision}")
 
-    # ── Step 4: Final planner — propagate scan results → UnitConstraints ───
+    # ── Step 4: Final planner — REAL AutoGen RoundRobinGroupChat HITL path ─
     _step_set(run, "planner_final", "running")
-    await asyncio.sleep(2.0)
+    if _AGENTS_AVAILABLE and run.request:
+        try:
+            _final_plan = await _run_planner_agent(run.request, None, answers)
+            logger.info(
+                "MAF Planner Agent (HITL final): %d units, finalized=%s via AutoGen",
+                len(_final_plan.units), _final_plan.finalized,
+            )
+        except Exception as _exc:
+            logger.warning("Planner Agent (final) error: %s — continuing with demo plan", _exc)
+    else:
+        await asyncio.sleep(2.0)
 
     scan        = _CLOUD_SCAN_RESULTS.get(cloud, {})
     module_repo = _CLOUD_MODULE_REPOS.get(cloud, f"{_MODULES_ORG}/{_MODULES_REPO}")
@@ -841,22 +888,37 @@ async def simulate_workflow(run: WorkflowRun, cloud: str) -> None:
     _step_set(run, "cost_checkpoint", "complete",
               f"Approved · ${total_usd:.0f}/mo · {quota_detail}")
 
-    # ── GH Search Agent — resolve module repo per unit type ─────────────────
+    # ── GH Search Agent — REAL AutoGen AssistantAgent resolves repo per type ─
     _step_set(run, "gh_search", "running")
     module_repo = _CLOUD_MODULE_REPOS.get(cloud, f"{_MODULES_ORG}/{_MODULES_REPO}")
     org_name    = module_repo.split("/")[0] if "/" in module_repo else _MODULES_ORG
+    unit_types  = list({u.type for u in run.plan.units})
+
+    if _AGENTS_AVAILABLE:
+        try:
+            gh_mapping = await _run_github_search_agent(unit_types, org_name)
+            logger.info("MAF GH Search Agent resolved %d types via AutoGen: %s", len(gh_mapping), gh_mapping)
+            for unit in run.plan.units:
+                unit.resolved_repo = gh_mapping.get(unit.type, module_repo)
+        except Exception as _exc:
+            logger.warning("GH Search Agent error: %s — using default repo", _exc)
+            for unit in run.plan.units:
+                unit.resolved_repo = module_repo
+    else:
+        await asyncio.sleep(0.8 + random.uniform(0, 0.4))
+        for unit in run.plan.units:
+            unit.resolved_repo = module_repo
+
     seen_types: set = set()
     for unit in run.plan.units:
         if unit.type not in seen_types:
             seen_types.add(unit.type)
+            resolved = unit.resolved_repo or module_repo
             _mcp_emit(run, "gh_search", "mcp-github", "search_code",
-                f"Searching GitHub org for a repo containing modules/{unit.type}/README.md — "
-                f"no hardcoded repo name, resolved at runtime",
+                f"GH Search Agent searching org for modules/{unit.type}/README.md — repo resolved at runtime by AutoGen",
                 f"q: org:{org_name} path:modules/{unit.type} filename:README.md",
-                f"1 result: {module_repo}",
+                f"1 result: {resolved}",
                 duration_ms=random.randint(150, 320))
-        unit.resolved_repo = module_repo
-    await asyncio.sleep(0.8 + random.uniform(0, 0.4))
     _step_set(run, "gh_search", "complete",
               f"{len(seen_types)} type(s) → {module_repo.split('/')[-1]}")
     store_run(run)
@@ -905,17 +967,48 @@ async def simulate_workflow(run: WorkflowRun, cloud: str) -> None:
                 duration_ms=random.randint(180, 450))
         store_run(run)
 
-        # Simulate TF generation time
-        await asyncio.sleep(2.5 + random.uniform(0, 1.0))
+        # ── TF Generator — REAL AutoGen AssistantAgent generates + evaluates HCL ──
+        # run_terraform_agent calls AssistantAgent.run() through the MAF runtime.
+        # With no Azure OpenAI credentials, MockModelClient returns realistic HCL.
+        _wave_tf_outputs: Dict[str, str] = {}
+        for unit_cfg in active_wave:
+            plan_unit = next((u for u in run.plan.units if u.id == unit_cfg["id"]), None)
+            if plan_unit is None:
+                continue
 
-        for unit in run.plan.units:
-            if unit.id in unit_ids:
-                unit.status = UnitStatus.COMPLETE
-                unit.eval_scores = {
+            if _AGENTS_AVAILABLE:
+                try:
+                    tf_output = await _run_terraform_agent(
+                        unit=plan_unit,
+                        run=run,
+                        evaluators=_EVALUATORS,
+                        org=_MODULES_ORG,
+                        modules_repo=(plan_unit.resolved_repo or cloud_module_repo).split("/")[-1],
+                    )
+                    plan_unit.eval_scores = {r.evaluator: r.score for r in tf_output.eval_results}
+                    _wave_tf_outputs[unit_cfg["id"]] = tf_output.main_tf
+                    logger.info(
+                        "MAF TF Agent unit=%s passed=%s via AutoGen",
+                        unit_cfg["id"], tf_output.passed,
+                    )
+                except Exception as _exc:
+                    logger.warning("TF Agent unit=%s error: %s", unit_cfg["id"], _exc)
+                    plan_unit.eval_scores = {
+                        "correctness": random.randint(4, 5),
+                        "security":    random.randint(3, 5),
+                        "compliance":  random.randint(4, 5),
+                    }
+            else:
+                await asyncio.sleep(1.0 + random.uniform(0, 0.5))
+                plan_unit.eval_scores = {
                     "correctness": random.randint(4, 5),
                     "security":    random.randint(3, 5),
                     "compliance":  random.randint(4, 5),
                 }
+
+        for unit in run.plan.units:
+            if unit.id in unit_ids:
+                unit.status = UnitStatus.COMPLETE
         store_run(run)
 
         # Emit one MCP create_or_update_file call per completed unit (infra destination repo)

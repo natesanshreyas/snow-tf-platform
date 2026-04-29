@@ -42,6 +42,7 @@ from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_agentchat.conditions import MaxMessageTermination
 from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
 
+from agents.mock_client import get_model_client
 from orchestrator.models import Plan, PlanUnit, SnowRequest, UnitConstraints
 
 logger = logging.getLogger(__name__)
@@ -90,13 +91,8 @@ identify constraints and unresolved questions.
 # ---------------------------------------------------------------------------
 
 
-def _make_model_client() -> AzureOpenAIChatCompletionClient:
-    return AzureOpenAIChatCompletionClient(
-        azure_deployment=os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"],
-        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-        api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2025-04-01-preview"),
-        api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
-    )
+def _make_model_client():
+    return get_model_client()
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +217,7 @@ async def _run_planner_with_hitl(
     """
     answers_iter = iter(human_answers.values())
 
-    async def _stored_input_fn(prompt: str) -> str:  # type: ignore[override]
+    async def _stored_input_fn(prompt: str, cancellation_token=None) -> str:
         """Return the next pre-stored human answer, or signal completion."""
         try:
             answer = next(answers_iter)

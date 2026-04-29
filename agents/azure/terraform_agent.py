@@ -27,6 +27,8 @@ from typing import Callable, List, Optional
 from autogen_agentchat.agents import AssistantAgent
 from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
 
+from agents.mock_client import get_model_client
+
 from mcp.github import get_latest_module_version, read_module_readme
 from orchestrator.models import EvaluatorResult, PlanUnit, WorkflowRun
 
@@ -96,13 +98,8 @@ Output ONLY this JSON — no prose, no markdown fences:
 # ---------------------------------------------------------------------------
 
 
-def _build_model_client() -> AzureOpenAIChatCompletionClient:
-    return AzureOpenAIChatCompletionClient(
-        azure_deployment=os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"],
-        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-        api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2025-04-01-preview"),
-        api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
-    )
+def _build_model_client():
+    return get_model_client()
 
 
 # ---------------------------------------------------------------------------

@@ -1,24 +1,32 @@
 """
-demo_server.py — Lightweight FastAPI server for the provisioning demo.
+demo_server.py — FastAPI server for the SNOW multi-agent platform.
 
-Starts the orchestrator API with ONLY the demo endpoints wired up.
-No cloud credentials or agent-framework required — the simulation
-generates realistic step-by-step progression without real LLM/API calls.
+LLM credentials (one of):
+  AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_DEPLOYMENT_NAME   — Azure OpenAI
+  OPENAI_API_KEY                                          — OpenAI (gpt-4o)
+  MOCK_LLM=true                                           — local dev only, no real LLM
 
-Usage:
-    pip install fastapi uvicorn httpx
+MCP credentials (optional — set DEMO_MODE=true to skip):
+  GITHUB_PERSONAL_ACCESS_TOKEN  — real branch/PR creation in terraform-demo-app
+  SERVICENOW_INSTANCE_URL etc.  — real SNOW work note updates
+
+Usage (with real LLM):
+    export OPENAI_API_KEY=sk-...
     python -m uvicorn demo_server:app --port 8001 --reload
 
-Then visit http://localhost:3000/snow in the WorkbenchIQ frontend.
+Usage (local dev, no credentials):
+    MOCK_LLM=true python -m uvicorn demo_server:app --port 8001 --reload
 """
 
 import logging
+import os
+
+# DEMO_MODE stubs out GitHub/ServiceNow MCP calls so real API tokens are not
+# required. It does NOT affect the LLM — configure that separately above.
+os.environ.setdefault("DEMO_MODE", "true")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 
-# Import the FastAPI app — this wires up all routes including /demo/* and /runs/*
-# No WorkflowEngine needed for demo routes (they bypass the engine entirely)
-from orchestrator.server import app  # noqa: E402  (after logging setup)
+from orchestrator.server import app  # noqa: E402
 
-# Re-export app so uvicorn picks it up
 __all__ = ["app"]
